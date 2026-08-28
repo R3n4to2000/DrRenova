@@ -1,0 +1,841 @@
+// Renovamed — Fatia 1: Fundação
+// Schema atualizado conforme Gate Técnico (versionamento, snapshot financeiro,
+// relações formais, governança de ConversationMessage, idempotência, UTC).
+//
+// CORREÇÃO DE CONSISTÊNCIA (ver docs/DECISOES-TECNICAS.md, ADR Prisma → pg):
+// toda coluna tem @map() explícito para bater exatamente com o SQL aplicado
+// em prisma/migrations/0001_init.sql (nomes snake_case). Sem isso, o dia em
+// que o Prisma Client voltar a ser usável neste ambiente, todo campo
+// divergiria silenciosamente do banco real.
+//
+// ================================================================
+// O QUE ESTE ARQUIVO NÃO REPRESENTA (POR DESIGN — NÃO É DIVERGÊNCIA)
+// ================================================================
+// Prisma Schema modela TABELAS, COLUNAS, TIPOS e RELAÇÕES. As seguintes
+// camadas de segurança/comportamento vivem exclusivamente em
+// prisma/migrations/*.sql e são verificadas por testes de integração
+// (tests/integration/rls*.test.ts), não por este arquivo nem pelo script
+// de consistência (scripts/check-schema-consistency.mjs), que compara
+// apenas colunas:
+//   - RLS (ALTER TABLE ... ENABLE ROW LEVEL SECURITY) — 10 tabelas em
+//     0002/0007; ver docs/SECURITY.md.
+//   - Policies (34+ no total) — todas em 0002/0003/0004/0005/0006/0007/0008.
+//   - Funções SECURITY DEFINER (fn_doctor_has_patient, fn_doctor_has_treatment)
+//     — 0003.
+//   - GRANTs/REVOKEs de privilégio por role (app_migrator vs. app_runtime,
+//     incluindo o append-only de audit_logs) — 0002.
+//   - Trigger de state machine de Subscription (check_subscription_transition)
+//     — 0002.
+// Isso é uma EXTENSÃO DELIBERADA de segurança implementada em SQL puro,
+// não uma lacuna de modelagem — o Prisma Schema Language não tem uma forma
+// nativa de expressar RLS/policies/triggers/grants. O script de
+// consistência intencionalmente NÃO verifica essas camadas (verificá-las
+// exigiria reimplementar um parser de SQL de policies, o que teria custo
+// desproporcional ao risco); a garantia de que elas existem e funcionam
+// vem dos testes de integração, não da checagem estrutural de schema.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ================================================================
+// IDENTIDADE / RBAC
+// ================================================================
+
+enum UserRole {
+  PATIENT
+  DOCTOR
+  ADMIN
+  SUPPORT
+
+  @@map("user_role")
+}
+
+model User {
+  id          String   @id @default(uuid())
+  authUserId  String   @unique @map("auth_user_id")
+  email       String   @unique
+  role        UserRole
+  mfaEnabled  Boolean  @default(false) @map("mfa_enabled")
+  mfaRequired Boolean  @default(false) @map("mfa_required")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  patient Patient?
+  doctor  Doctor?
+
+  @@map("users")
+}
+
+// ================================================================
+// PACIENTE / MÉDICO / CARTEIRA
+// ================================================================
+
+model Patient {
+  id     String @id @default(uuid())
+  userId String @unique @map("user_id")
+  user   User   @relation(fields: [userId], references: [id])
+
+  fullName          String    @map("full_name")
+  cpfEncrypted      String    @map("cpf_encrypted")
+  cpfHash           String    @unique @map("cpf_hash")
+  birthDate         DateTime  @map("birth_date") @db.Date
+  whatsappEncrypted String    @map("whatsapp_encrypted")
+  whatsappLast4     String    @map("whatsapp_last4")
+  whatsappHash      String?   @map("whatsapp_hash")
+  anonymizedAt      DateTime? @map("anonymized_at") @db.Timestamptz(6)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  treatments              Treatment[]
+  adesoes                 Adesao[]
+  eligibilityDecisions    EligibilityDecision[]
+  assignments             DoctorPatientAssignment[]
+  conversations           Conversation[]
+  communicationPreference PatientCommunicationPreference?
+  communicationConsents   CommunicationConsent[]
+
+  @@map("patients")
+}
+
+enum DoctorStatus {
+  ACTIVE
+  ON_LEAVE
+  INACTIVE
+
+  @@map("doctor_status")
+}
+
+model Doctor {
+  id     String @id @default(uuid())
+  userId String @unique @map("user_id")
+  user   User   @relation(fields: [userId], references: [id])
+
+  fullName  String       @map("full_name")
+  crm       String
+  crmState  String       @map("crm_state")
+  specialty String
+  status    DoctorStatus @default(ACTIVE)
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  assignments          DoctorPatientAssignment[]
+  eligibilityDecisions EligibilityDecision[]
+  decisions            DoctorDecision[]
+  assumedIntercorrencias Intercorrencia[]
+  prescriptions        Prescription[]
+
+  @@unique([crm, crmState])
+  @@map("doctors")
+}
+
+model DoctorPatientAssignment {
+  id          String     @id @default(uuid())
+  patientId   String     @map("patient_id")
+  patient     Patient    @relation(fields: [patientId], references: [id])
+  doctorId    String     @map("doctor_id")
+  doctor      Doctor     @relation(fields: [doctorId], references: [id])
+  treatmentId String?    @map("treatment_id")
+  treatment   Treatment? @relation(fields: [treatmentId], references: [id])
+
+  startedAt DateTime  @default(now()) @map("started_at") @db.Timestamptz(6)
+  endedAt   DateTime? @map("ended_at") @db.Timestamptz(6)
+  reason    String?
+  isCurrent Boolean   @default(true) @map("is_current")
+
+  @@index([patientId, isCurrent])
+  @@index([doctorId, isCurrent])
+  @@map("doctor_patient_assignments")
+}
+
+// ================================================================
+// CONFIGURAÇÃO VERSIONADA
+// ================================================================
+
+enum ConfigStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+
+  @@map("config_status")
+}
+
+model PlanConfig {
+  id             String       @id @default(uuid())
+  planKey        String       @map("plan_key")
+  version        Int
+  name           String
+  adesaoAmount   Decimal      @map("adesao_amount") @db.Decimal(10, 2)
+  monthlyAmount  Decimal      @map("monthly_amount") @db.Decimal(10, 2)
+  annualAmount   Decimal      @map("annual_amount") @db.Decimal(10, 2)
+  maxTreatments  Int          @default(1) @map("max_treatments")
+  status         ConfigStatus @default(DRAFT)
+  effectiveFrom  DateTime     @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil DateTime?    @map("effective_until") @db.Timestamptz(6)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  subscriptions Subscription[]
+  adesoes       Adesao[]
+
+  @@unique([planKey, version])
+  @@map("plan_configs")
+}
+
+model CategoryConfig {
+  id                      String       @id @default(uuid())
+  categoryKey             String       @map("category_key")
+  version                 Int
+  name                    String
+  icon                    String?
+  defaultReviewPeriodDays Int          @map("default_review_period_days")
+  status                  ConfigStatus @default(DRAFT)
+  effectiveFrom           DateTime     @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil          DateTime?    @map("effective_until") @db.Timestamptz(6)
+  createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  // Regra dos 180 dias — infraestrutura configurável, NUNCA hardcoded
+  // (ver docs/PENDENCIAS.md: interpretação jurídica/clínica ainda pendente).
+  inPersonEvaluationRuleEnabled Boolean @default(false) @map("in_person_evaluation_rule_enabled")
+  inPersonEvaluationMaxDays     Int?    @map("in_person_evaluation_max_days")
+
+  treatments          Treatment[]
+  questionnaireVersions CategoryQuestionnaireVersion[]
+
+  @@unique([categoryKey, version])
+  @@map("category_configs")
+}
+
+// ================================================================
+// TRATAMENTO / ONBOARDING / ASSINATURA
+// ================================================================
+
+enum TreatmentStatus {
+  ONBOARDING
+  ACTIVE
+  PAUSED
+  ENDED
+
+  @@map("treatment_status")
+}
+
+model Treatment {
+  id               String         @id @default(uuid())
+  patientId        String         @map("patient_id")
+  patient          Patient        @relation(fields: [patientId], references: [id])
+  categoryConfigId String         @map("category_config_id")
+  categoryConfig   CategoryConfig @relation(fields: [categoryConfigId], references: [id])
+
+  status                   TreatmentStatus @default(ONBOARDING)
+  reviewPeriodDaysOverride Int?      @map("review_period_days_override")
+  lastReviewAt             DateTime? @map("last_review_at") @db.Timestamptz(6)
+  nextReviewDueAt          DateTime? @map("next_review_due_at") @db.Timestamptz(6)
+  lastInPersonContactAt    DateTime? @map("last_in_person_contact_at") @db.Timestamptz(6)
+  activatedAt              DateTime? @map("activated_at") @db.Timestamptz(6)
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  assignments          DoctorPatientAssignment[]
+  clinicalEvents       ClinicalEvent[]
+  subscription         Subscription?
+  adesoes              Adesao[]
+  eligibilityDecisions EligibilityDecision[]
+  checkIns             CheckIn[]
+  doctorDecisions      DoctorDecision[]
+  intercorrencias      Intercorrencia[]
+  prescriptions        Prescription[]
+
+  @@map("treatments")
+}
+
+enum SubscriptionStatus {
+  PENDING_ELIGIBILITY
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+
+  @@map("subscription_status")
+}
+
+enum BillingPeriod {
+  MONTHLY
+  ANNUAL
+
+  @@map("billing_period")
+}
+
+model Subscription {
+  id          String    @id @default(uuid())
+  patientId   String    @map("patient_id")
+  treatmentId String    @unique @map("treatment_id")
+  treatment   Treatment @relation(fields: [treatmentId], references: [id])
+
+  planConfigId  String             @map("plan_config_id")
+  planConfig    PlanConfig         @relation(fields: [planConfigId], references: [id])
+  billingPeriod BillingPeriod      @default(MONTHLY) @map("billing_period")
+  status        SubscriptionStatus @default(PENDING_ELIGIBILITY)
+
+  monthlyAmountSnapshot Decimal  @map("monthly_amount_snapshot") @db.Decimal(10, 2)
+  annualAmountSnapshot  Decimal  @map("annual_amount_snapshot") @db.Decimal(10, 2)
+  snapshotAt            DateTime @default(now()) @map("snapshot_at") @db.Timestamptz(6)
+
+  firstChargeAt DateTime? @map("first_charge_at") @db.Timestamptz(6)
+  nextChargeAt  DateTime? @map("next_charge_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  statusTransitions SubscriptionStatusTransition[]
+
+  @@map("subscriptions")
+}
+
+model SubscriptionStatusTransition {
+  id             String              @id @default(uuid())
+  subscriptionId String              @map("subscription_id")
+  subscription   Subscription        @relation(fields: [subscriptionId], references: [id])
+  fromStatus     SubscriptionStatus? @map("from_status")
+  toStatus       SubscriptionStatus  @map("to_status")
+  reason         String?
+  occurredAt     DateTime            @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  @@map("subscription_status_transitions")
+}
+
+model Adesao {
+  id           String     @id @default(uuid())
+  patientId    String     @map("patient_id")
+  patient      Patient    @relation(fields: [patientId], references: [id])
+  treatmentId  String     @map("treatment_id")
+  treatment    Treatment  @relation(fields: [treatmentId], references: [id])
+  planConfigId String     @map("plan_config_id")
+  planConfig   PlanConfig @relation(fields: [planConfigId], references: [id])
+
+  amountSnapshot Decimal   @map("amount_snapshot") @db.Decimal(10, 2)
+  status         String
+  paidAt         DateTime? @map("paid_at") @db.Timestamptz(6)
+  idempotencyKey String    @unique @map("idempotency_key")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("adesoes")
+}
+
+enum EligibilityOutcome {
+  APPROVED
+  NEEDS_MORE_INFO
+  NOT_ELIGIBLE
+
+  @@map("eligibility_outcome")
+}
+
+model EligibilityDecision {
+  id          String    @id @default(uuid())
+  patientId   String    @map("patient_id")
+  patient     Patient   @relation(fields: [patientId], references: [id])
+  treatmentId String    @map("treatment_id")
+  treatment   Treatment @relation(fields: [treatmentId], references: [id])
+  doctorId    String    @map("doctor_id")
+  doctor      Doctor    @relation(fields: [doctorId], references: [id])
+
+  outcome      EligibilityOutcome
+  clinicalNote String?            @map("clinical_note")
+  decidedAt    DateTime           @default(now()) @map("decided_at") @db.Timestamptz(6)
+
+  @@index([treatmentId, decidedAt])
+  @@map("eligibility_decisions")
+}
+
+// ================================================================
+// CLÍNICO / AUDITORIA
+// ================================================================
+
+model ClinicalEvent {
+  id          String    @id @default(uuid())
+  treatmentId String    @map("treatment_id")
+  treatment   Treatment @relation(fields: [treatmentId], references: [id])
+  type        String
+  occurredAt  DateTime  @default(now()) @map("occurred_at") @db.Timestamptz(6)
+  payload     Json
+
+  @@map("clinical_events")
+}
+
+model AuditLog {
+  id            String   @id @default(uuid())
+  correlationId String   @map("correlation_id")
+  actorId       String?  @map("actor_id")
+  actorType     String   @map("actor_type")
+  action        String
+  entityType    String   @map("entity_type")
+  entityId      String   @map("entity_id")
+  origin        String
+  result        String
+  metadata      Json?
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([entityType, entityId])
+  @@map("audit_logs")
+}
+
+// ================================================================
+// CONVERSATION (fundação para a Camilla — Fatia 3)
+// ================================================================
+
+enum ConversationChannel {
+  WHATSAPP
+  WEB
+  SYSTEM
+
+  @@map("conversation_channel")
+}
+
+model Conversation {
+  id        String   @id @default(uuid())
+  patientId String   @map("patient_id")
+  patient   Patient  @relation(fields: [patientId], references: [id])
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  messages ConversationMessage[]
+
+  @@map("conversations")
+}
+
+enum MessageSender {
+  PATIENT
+  CAMILLA
+  DOCTOR
+  SYSTEM
+
+  @@map("message_sender")
+}
+
+enum MessageType {
+  TEXT
+  STRUCTURED_DATA
+  SYSTEM_NOTICE
+
+  @@map("message_type")
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+
+  @@map("delivery_status")
+}
+
+model ConversationMessage {
+  id             String       @id @default(uuid())
+  conversationId String       @map("conversation_id")
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  sender            MessageSender
+  channel           ConversationChannel
+  messageType       MessageType    @default(TEXT) @map("message_type")
+  content           String
+  actorUserId       String?        @map("actor_user_id")
+  externalMessageId String?        @map("external_message_id")
+  deliveryStatus    DeliveryStatus @default(SENT) @map("delivery_status")
+  occurredAt        DateTime       @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  intentClassifications IntentClassification[]
+  aiExecutions          AIExecution[]
+
+  @@index([conversationId, occurredAt])
+  @@map("conversation_messages")
+}
+
+model PatientCommunicationPreference {
+  id               String              @id @default(uuid())
+  patientId        String              @unique @map("patient_id")
+  patient          Patient             @relation(fields: [patientId], references: [id])
+  preferredHour    Int?                @map("preferred_hour")
+  timezone         String              @default("UTC")
+  preferredChannel ConversationChannel @default(WHATSAPP) @map("preferred_channel")
+  optedOut         Boolean             @default(false) @map("opted_out")
+  updatedAt        DateTime            @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("patient_communication_preferences")
+}
+
+model CommunicationConsent {
+  id         String              @id @default(uuid())
+  patientId  String              @map("patient_id")
+  patient    Patient             @relation(fields: [patientId], references: [id])
+  purpose    String
+  channel    ConversationChannel
+  version    String
+  origin     String
+  acceptedAt DateTime            @default(now()) @map("accepted_at") @db.Timestamptz(6)
+  revokedAt  DateTime?           @map("revoked_at") @db.Timestamptz(6)
+
+  @@map("communication_consents")
+}
+
+// ================================================================
+// ANALYTICS
+// ================================================================
+
+model AnalyticsEvent {
+  id         String   @id @default(uuid())
+  patientId  String?  @map("patient_id")
+  eventName  String   @map("event_name")
+  properties Json?
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(6)
+
+  @@index([eventName, occurredAt])
+  @@map("analytics_events")
+}
+
+// ================================================================
+// IDEMPOTÊNCIA
+// ================================================================
+
+model IdempotencyKey {
+  key       String   @id
+  scope     String
+  resultRef String?  @map("result_ref")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([scope])
+  @@map("idempotency_keys")
+}
+
+// ================================================================
+// FATIA 2 — TREATMENT CONTINUITY ENGINE
+// (Engine = quando/o quê · Médico = decisão clínica · Camilla, ainda não
+// implementada, será "como conversar" na Fatia 3 — ver eventos emitidos)
+// ================================================================
+
+enum QuestionnaireType {
+  ANAMNESIS
+  CHECKIN
+
+  @@map("questionnaire_type")
+}
+
+model CategoryQuestionnaireVersion {
+  id                 String            @id @default(uuid())
+  categoryConfigId   String            @map("category_config_id")
+  categoryConfig     CategoryConfig    @relation(fields: [categoryConfigId], references: [id])
+  questionnaireType  QuestionnaireType @map("questionnaire_type")
+  version            Int
+  status             ConfigStatus      @default(DRAFT)
+  effectiveFrom      DateTime          @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil     DateTime?         @map("effective_until") @db.Timestamptz(6)
+  createdAt          DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  fields   CategoryQuestionnaireField[]
+  checkIns CheckIn[]
+
+  @@unique([categoryConfigId, questionnaireType, version])
+  @@map("category_questionnaire_versions")
+}
+
+enum AnswerValueType {
+  NUMBER
+  BOOLEAN
+  OPTION
+  TEXT
+  DATE
+
+  @@map("answer_value_type")
+}
+
+model CategoryQuestionnaireField {
+  id                     String                       @id @default(uuid())
+  questionnaireVersionId String                       @map("questionnaire_version_id")
+  questionnaireVersion   CategoryQuestionnaireVersion @relation(fields: [questionnaireVersionId], references: [id])
+  fieldKey               String                       @map("field_key")
+  label                  String
+  valueType              AnswerValueType              @map("value_type")
+  required               Boolean                      @default(true)
+  orderIndex             Int                          @default(0) @map("order_index")
+  options                Json?
+  createdAt              DateTime                     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([questionnaireVersionId, fieldKey])
+  @@map("category_questionnaire_fields")
+}
+
+enum CheckInStatus {
+  SCHEDULED
+  OPEN
+  ANSWERED
+  EXPIRED
+  CANCELLED
+
+  @@map("checkin_status")
+}
+
+model CheckIn {
+  id                     String                       @id @default(uuid())
+  treatmentId            String                       @map("treatment_id")
+  treatment              Treatment                    @relation(fields: [treatmentId], references: [id])
+  questionnaireVersionId String                       @map("questionnaire_version_id")
+  questionnaireVersion   CategoryQuestionnaireVersion @relation(fields: [questionnaireVersionId], references: [id])
+  status                 CheckInStatus                @default(SCHEDULED)
+  scheduledFor           DateTime                     @map("scheduled_for") @db.Timestamptz(6)
+  openedAt               DateTime?                    @map("opened_at") @db.Timestamptz(6)
+  answeredAt             DateTime?                    @map("answered_at") @db.Timestamptz(6)
+  expiresAt              DateTime?                    @map("expires_at") @db.Timestamptz(6)
+  createdAt              DateTime                     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  answers          CheckInAnswer[]
+  doctorDecisions  DoctorDecision[]
+
+  @@index([treatmentId, status])
+  @@map("check_ins")
+}
+
+model CheckInAnswer {
+  id         String          @id @default(uuid())
+  checkInId  String          @map("check_in_id")
+  checkIn    CheckIn         @relation(fields: [checkInId], references: [id])
+  fieldKey   String          @map("field_key")
+  valueType  AnswerValueType @map("value_type")
+  valueJson  Json            @map("value_json")
+  rawInput   String?         @map("raw_input")
+  createdAt  DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@unique([checkInId, fieldKey])
+  @@map("check_in_answers")
+}
+
+enum DoctorDecisionAction {
+  MAINTAIN
+  REQUEST_INFORMATION
+  REQUEST_EXAM
+  REQUEST_TELECONSULTATION
+  REQUEST_IN_PERSON_EVALUATION
+  ISSUE_PRESCRIPTION
+  CHANGE_REVIEW_PERIOD
+  REGISTER_CONDUCT
+  REFER
+  END_TREATMENT
+
+  @@map("doctor_decision_action")
+}
+
+/// Append-only por contrato de aplicação E por GRANT de banco (mesma
+/// estratégia de audit_logs na Fatia 1) — nunca sobrescrita.
+model DoctorDecision {
+  id                  String               @id @default(uuid())
+  treatmentId         String               @map("treatment_id")
+  treatment           Treatment            @relation(fields: [treatmentId], references: [id])
+  doctorId            String               @map("doctor_id")
+  doctor              Doctor               @relation(fields: [doctorId], references: [id])
+  action              DoctorDecisionAction
+  note                String?
+  reviewPeriodDaysNew Int?                 @map("review_period_days_new")
+  originCheckInId     String?              @map("origin_check_in_id")
+  originCheckIn       CheckIn?             @relation(fields: [originCheckInId], references: [id])
+  decidedAt           DateTime             @default(now()) @map("decided_at") @db.Timestamptz(6)
+
+  prescriptions   Prescription[]
+  intercorrencias Intercorrencia[]
+
+  @@index([treatmentId, decidedAt])
+  @@map("doctor_decisions")
+}
+
+enum IntercorrenciaStatus {
+  OPEN
+  IN_REVIEW
+  RESOLVED
+
+  @@map("intercorrencia_status")
+}
+
+model Intercorrencia {
+  id                   String                @id @default(uuid())
+  treatmentId          String                @map("treatment_id")
+  treatment            Treatment             @relation(fields: [treatmentId], references: [id])
+  origin               String // 'CHECKIN' | 'MANUAL' | 'ENGINE'
+  description          String
+  priority             String                @default("ROTINA") // operacional/administrativo, nunca clínico
+  status               IntercorrenciaStatus  @default(OPEN)
+  assumedByDoctorId    String?               @map("assumed_by_doctor_id")
+  assumedByDoctor      Doctor?               @relation(fields: [assumedByDoctorId], references: [id])
+  resolvedByDecisionId String?               @map("resolved_by_decision_id")
+  resolvedByDecision   DoctorDecision?       @relation(fields: [resolvedByDecisionId], references: [id])
+  openedAt             DateTime              @default(now()) @map("opened_at") @db.Timestamptz(6)
+  resolvedAt           DateTime?             @map("resolved_at") @db.Timestamptz(6)
+
+  @@index([treatmentId, status])
+  @@map("intercorrencias")
+}
+
+enum PrescriptionStatus {
+  DRAFT
+  PENDING_SIGNATURE
+  SIGNED
+  DELIVERED
+  FAILED
+  CANCELLED
+
+  @@map("prescription_status")
+}
+
+model Prescription {
+  id               String             @id @default(uuid())
+  treatmentId      String             @map("treatment_id")
+  treatment        Treatment          @relation(fields: [treatmentId], references: [id])
+  doctorId         String             @map("doctor_id")
+  doctor           Doctor             @relation(fields: [doctorId], references: [id])
+  originDecisionId String             @map("origin_decision_id")
+  originDecision   DoctorDecision     @relation(fields: [originDecisionId], references: [id])
+  status           PrescriptionStatus @default(DRAFT)
+  providerRef      String?            @map("provider_ref")
+  documentRef      String?            @map("document_ref")
+  createdAt        DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  signedAt         DateTime?          @map("signed_at") @db.Timestamptz(6)
+  deliveredAt      DateTime?          @map("delivered_at") @db.Timestamptz(6)
+
+  @@index([treatmentId])
+  @@map("prescriptions")
+}
+
+// ================================================================
+// MVP INTEGRATION — CAMILLA (infraestrutura)
+// Reaproveita deliberadamente Conversation/ConversationMessage (Fatia 1) e
+// Intercorrencia (Fatia 2, origin='CAMILLA') — nenhuma fila/tabela paralela.
+// ================================================================
+
+enum SafetyRuleStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+
+  @@map("safety_rule_status")
+}
+
+enum SafetyRuleOperator {
+  GT
+  GTE
+  LT
+  LTE
+  EQ
+
+  @@map("safety_rule_operator")
+}
+
+enum CamillaIntent {
+  ADMINISTRATIVE
+  STRUCTURED_FOLLOWUP
+  CLINICAL_QUESTION
+  POSSIBLE_INTERCURRENCE
+  POTENTIAL_URGENCY
+  HUMAN_SUPPORT_REQUIRED
+
+  @@map("camilla_intent")
+}
+
+/// Versionada como PlanConfig/CategoryConfig. Nasce VAZIA — nenhum limiar
+/// clínico é inventado pelo desenvolvedor; só a Direção Médica publica
+/// regras ACTIVE (ver docs/SECURITY.md).
+model DeterministicSafetyRule {
+  id              String               @id @default(uuid())
+  ruleKey         String               @map("rule_key")
+  version         Int
+  fieldKey        String               @map("field_key")
+  operator        SafetyRuleOperator
+  threshold       Decimal              @db.Decimal
+  action          String               @default("ESCALATE")
+  status          SafetyRuleStatus     @default(DRAFT)
+  approvedBy      String?              @map("approved_by")
+  effectiveFrom   DateTime             @default(now()) @map("effective_from") @db.Timestamptz(6)
+  effectiveUntil  DateTime?            @map("effective_until") @db.Timestamptz(6)
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  intentClassifications IntentClassification[]
+
+  @@unique([ruleKey, version])
+  @@map("deterministic_safety_rules")
+}
+
+model IntentClassification {
+  id                      String                   @id @default(uuid())
+  conversationMessageId   String                   @map("conversation_message_id")
+  conversationMessage     ConversationMessage      @relation(fields: [conversationMessageId], references: [id])
+  intent                  CamillaIntent
+  triggeredSafetyRuleId   String?                  @map("triggered_safety_rule_id")
+  triggeredSafetyRule     DeterministicSafetyRule? @relation(fields: [triggeredSafetyRuleId], references: [id])
+  createdAt               DateTime                 @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([conversationMessageId])
+  @@map("intent_classifications")
+}
+
+model PromptVersion {
+  id          String       @id @default(uuid())
+  name        String
+  version     Int
+  description String?
+  status      ConfigStatus @default(DRAFT)
+  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  executions AIExecution[]
+
+  @@unique([name, version])
+  @@map("prompt_versions")
+}
+
+/// Observabilidade obrigatória de IA — nunca grava segredo, nunca duplica
+/// conteúdo de prontuário. `model` rotula explicitamente se é STAGING
+/// (heurística) ou um provedor real de IA no futuro.
+model AIExecution {
+  id                    String         @id @default(uuid())
+  conversationMessageId String?        @map("conversation_message_id")
+  conversationMessage   ConversationMessage? @relation(fields: [conversationMessageId], references: [id])
+  promptVersionId       String?        @map("prompt_version_id")
+  promptVersion         PromptVersion? @relation(fields: [promptVersionId], references: [id])
+  model                 String
+  purpose               String
+  intentClassified      CamillaIntent? @map("intent_classified")
+  toolsUsed             Json?          @map("tools_used")
+  latencyMs             Int?           @map("latency_ms")
+  estimatedCostCents    Int            @default(0) @map("estimated_cost_cents")
+  escalated             Boolean        @default(false)
+  createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([createdAt])
+  @@map("ai_executions")
+}
+
+// ================================================================
+// PILOT READINESS — TRANSACTIONAL OUTBOX
+// Mutação clínica + AuditLog + OutboxEvent commitam juntos; o efeito
+// externo (ex.: enviar WhatsApp) só acontece DEPOIS, via dispatcher
+// separado — falha de fornecedor externo nunca reverte decisão clínica.
+// ================================================================
+
+enum OutboxStatus {
+  PENDING
+  SENT
+  FAILED
+  DEAD_LETTER
+  PROCESSING
+
+  @@map("outbox_status")
+}
+
+model OutboxEvent {
+  id              String       @id @default(uuid())
+  eventType       String       @map("event_type")
+  payload         Json
+  status          OutboxStatus @default(PENDING)
+  attempts        Int          @default(0)
+  maxAttempts     Int          @default(5) @map("max_attempts")
+  nextAttemptAt   DateTime     @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  lastError       String?      @map("last_error")
+  idempotencyKey  String?      @unique @map("idempotency_key")
+  processingSince DateTime?    @map("processing_since") @db.Timestamptz(6)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  sentAt          DateTime?    @map("sent_at") @db.Timestamptz(6)
+
+  @@index([status, nextAttemptAt])
+  @@map("outbox_events")
+}
+

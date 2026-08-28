@@ -1,0 +1,94 @@
+name: CI — Renovamed (Fundação)
+
+# Pipeline mínimo: instala, sobe um Postgres 16 limpo, aplica TODAS as
+# migrations do zero, checa consistência schema.prisma × banco, roda
+# typecheck, lint, testes e build. Qualquer etapa falhando reprova o
+# pipeline inteiro — nenhum passo crítico usa continue-on-error.
+#
+# Nenhum secret real é usado: as credenciais abaixo são valores de
+# desenvolvimento/teste, análogas às usadas localmente, nunca as de produção.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_only_password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: ci_only_password
+      # Credenciais de aplicação SÓ para este pipeline efêmero — nunca as de produção.
+      APP_MIGRATOR_PASSWORD: ci_migrator_password
+      APP_RUNTIME_PASSWORD: ci_runtime_password
+      DATABASE_URL: "postgresql://app_runtime:ci_runtime_password@localhost:5432/renovamed_ci?schema=public"
+      MIGRATE_DATABASE_URL: "postgresql://app_migrator:ci_migrator_password@localhost:5432/renovamed_ci?schema=public"
+      # Segredos de aplicação: em CI real, viriam de Secrets do repositório
+      # (ex.: ${{ secrets.FIELD_ENCRYPTION_KEY }}). Aqui, valores de teste
+      # gerados no próprio job, nunca reaproveitados fora do CI.
+      FIELD_ENCRYPTION_KEY: "Y2lfb25seV8zMl9ieXRlX2tleV9mb3JfdGVzdHM9"
+      FIELD_HASH_SECRET: "ci-only-hmac-secret-never-used-in-prod"
+      SESSION_TOKEN_SECRET: "ci-only-session-secret-never-used-in-prod"
+      AUTH_MODE: "development"
+      SUPABASE_JWT_SECRET: "ci-only-fake-supabase-secret-for-testing-only"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Criar roles e banco de dados (ambiente limpo)
+        run: |
+          psql -c "CREATE ROLE app_migrator LOGIN PASSWORD '${APP_MIGRATOR_PASSWORD}' SUPERUSER;"
+          psql -c "CREATE ROLE app_runtime LOGIN PASSWORD '${APP_RUNTIME_PASSWORD}';"
+          psql -c "CREATE DATABASE renovamed_ci OWNER app_migrator;"
+          psql -c "GRANT CONNECT ON DATABASE renovamed_ci TO app_runtime;"
+
+      - name: Aplicar todas as migrations (0001 → última), em ordem
+        run: |
+          set -e
+          for f in prisma/migrations/*.sql; do
+            echo "Aplicando $f"
+            psql "$MIGRATE_DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Checagem de consistência schema.prisma × banco
+        run: node scripts/check-schema-consistency.mjs
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Testes (unitários + integração + RLS + adversariais)
+        run: npm test
+
+      - name: Build
+        run: npm run build
