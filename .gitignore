@@ -4,3 +4,4 @@ node_modules/
 .env.staging
 tsconfig.tsbuildinfo
 *.log
+.env.local
