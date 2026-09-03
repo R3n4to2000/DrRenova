@@ -41,8 +41,8 @@ jobs:
       # Credenciais de aplicação SÓ para este pipeline efêmero — nunca as de produção.
       APP_MIGRATOR_PASSWORD: ci_migrator_password
       APP_RUNTIME_PASSWORD: ci_runtime_password
-      DATABASE_URL: "postgresql://app_runtime:ci_runtime_password@localhost:5432/renovamed_ci?schema=public"
-      MIGRATE_DATABASE_URL: "postgresql://app_migrator:ci_migrator_password@localhost:5432/renovamed_ci?schema=public"
+      DATABASE_URL: "postgresql://app_runtime:ci_runtime_password@localhost:5432/renovamed_ci"
+      MIGRATE_DATABASE_URL: "postgresql://app_migrator:ci_migrator_password@localhost:5432/renovamed_ci"
       # Segredos de aplicação: em CI real, viriam de Secrets do repositório
       # (ex.: ${{ secrets.FIELD_ENCRYPTION_KEY }}). Aqui, valores de teste
       # gerados no próprio job, nunca reaproveitados fora do CI.
