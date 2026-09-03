@@ -46,7 +46,7 @@ jobs:
       # Segredos de aplicação: em CI real, viriam de Secrets do repositório
       # (ex.: ${{ secrets.FIELD_ENCRYPTION_KEY }}). Aqui, valores de teste
       # gerados no próprio job, nunca reaproveitados fora do CI.
-      FIELD_ENCRYPTION_KEY: "Y2lfb25seV8zMl9ieXRlX2tleV9mb3JfdGVzdHM9"
+      FIELD_ENCRYPTION_KEY: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
       FIELD_HASH_SECRET: "ci-only-hmac-secret-never-used-in-prod"
       SESSION_TOKEN_SECRET: "ci-only-session-secret-never-used-in-prod"
       AUTH_MODE: "development"
